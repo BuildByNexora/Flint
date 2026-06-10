@@ -1,7 +1,7 @@
 use std::path::PathBuf;
 
 use clap::{Parser, Subcommand};
-use flint_core::{Algorithm, Limiter};
+use flint_core::{Algorithm, Limiter, TopBy};
 
 #[derive(Parser)]
 #[command(name = "flint", about = "embedded persistent rate limiter")]
@@ -18,6 +18,11 @@ enum Command {
         #[command(subcommand)]
         command: LimitCommand,
     },
+    Log {
+        #[command(subcommand)]
+        command: LogCommand,
+    },
+    Doctor,
 }
 
 #[derive(Subcommand)]
@@ -41,6 +46,17 @@ enum LimitCommand {
     History {
         key: String,
     },
+    Top {
+        #[arg(long, default_value = "denied")]
+        by: String,
+        #[arg(long, default_value_t = 20)]
+        limit: usize,
+    },
+}
+
+#[derive(Subcommand)]
+enum LogCommand {
+    Compact,
 }
 
 fn main() {
@@ -77,7 +93,27 @@ fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             LimitCommand::History { key } => {
                 println!("{}", serde_json::to_string_pretty(&limiter.history(&key)?)?);
             }
+            LimitCommand::Top { by, limit } => {
+                let by = match by.as_str() {
+                    "allowed" => TopBy::Allowed,
+                    "denied" => TopBy::Denied,
+                    other => return Err(format!("unsupported top selector: {other}").into()),
+                };
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&limiter.top(by, limit)?)?
+                );
+            }
         },
+        Command::Log { command } => match command {
+            LogCommand::Compact => {
+                limiter.compact()?;
+                println!("compacted");
+            }
+        },
+        Command::Doctor => {
+            println!("{}", serde_json::to_string_pretty(&limiter.doctor()?)?);
+        }
     }
     Ok(())
 }

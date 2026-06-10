@@ -39,13 +39,19 @@ Flint is an embedded rate limiter with:
 - Rust core;
 - Python bindings via PyO3;
 - append-only AOF persistence;
+- JSON snapshot and compaction;
 - single-writer data directory locking;
 - GIL-aware Python API;
 - CLI inspect/admin commands;
+- millisecond precision;
+- metrics counters;
+- Python decorator API;
 - token bucket algorithm;
 - sliding window log algorithm;
 - fixed window counter algorithm;
 - crash recovery from local files;
+- storage doctor checks;
+- v0.1 AOF compatibility for `per_seconds` entries;
 - no Redis, daemon, broker, or cloud dependency.
 
 ---
@@ -106,6 +112,26 @@ print(result.remaining)
 print(result.reset_at)
 ```
 
+Millisecond precision:
+
+```python
+limiter.limit("burst:login", rate=1, per="250ms")
+```
+
+Decorator:
+
+```python
+@limiter.rate_limit("email:send", rate=10, per="1m")
+def send_email():
+    ...
+```
+
+If the limit is exceeded, Flint raises:
+
+```python
+flint.RateLimitExceeded
+```
+
 ---
 
 ## CLI
@@ -116,6 +142,9 @@ flint limit list
 flint limit status "api:user-42"
 flint limit reset "api:user-42"
 flint limit history "api:user-42"
+flint limit top --by denied --limit 20
+flint log compact
+flint doctor
 ```
 
 Use a custom data directory:
@@ -143,6 +172,7 @@ Flint stores state under `data_dir`:
 ```text
 .flint/
   flint.aof
+  flint.snapshot
   flint.lock
 ```
 
@@ -155,9 +185,28 @@ DENY
 RESET
 ```
 
-On restart, Flint replays the log and restores counters. A crash-truncated final
-line is ignored deterministically; corruption in the middle of the log fails
-loudly.
+On restart, Flint loads `flint.snapshot` when present, replays the AOF tail, and
+restores counters. A crash-truncated final line is ignored deterministically;
+corruption in the middle of the log fails loudly.
+
+`flint doctor` validates the local storage files and reports the number of
+limits, history events, AOF bytes, and whether a snapshot is present.
+
+Flint v0.2 uses millisecond precision internally. Older v0.1 AOF entries that
+stored `per_seconds` are migrated during replay by converting seconds to
+milliseconds.
+
+Metrics exposed by `status()` and `list()`:
+
+```text
+total_allowed
+total_denied
+last_allowed_at
+last_denied_at
+last_reset_at
+remaining
+reset_at
+```
 
 ---
 
@@ -172,6 +221,24 @@ Flint replaces:
 - hand-written local counters with no history.
 
 The unique property is persistent rate limiting without Redis.
+
+---
+
+## Reliability Checks
+
+The current test suite covers the core failure paths for an embedded persistent
+limiter:
+
+- exclusive data directory locking;
+- concurrent checks on the same key;
+- 10,000 configured limits;
+- snapshot and compaction preserving status and metrics;
+- recovery from append-only log;
+- deterministic rejection of corrupted middle log records;
+- v0.1 `per_seconds` log migration to v0.2 `per_millis`;
+- Python decorator allowed/denied behavior;
+- `RateLimitExceeded` metadata;
+- CLI `compact`, `doctor`, and `top`.
 
 ---
 

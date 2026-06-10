@@ -1,5 +1,5 @@
 use std::fs::{File, OpenOptions};
-use std::io::{BufRead, BufReader, Write};
+use std::io::{BufRead, BufReader, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 
 use chrono::{DateTime, Utc};
@@ -50,8 +50,14 @@ impl AppendOnlyLog {
         Ok(())
     }
 
-    pub fn replay(&self) -> Result<Vec<Event>, FlintError> {
+    pub fn len(&self) -> Result<u64, FlintError> {
+        Ok(self.file.metadata()?.len())
+    }
+
+    pub fn replay_from(&self, offset: u64) -> Result<Vec<Event>, FlintError> {
         let file = File::open(&self.path)?;
+        let mut file = file;
+        file.seek(SeekFrom::Start(offset))?;
         let reader = BufReader::new(file);
         let lines = reader.lines().collect::<Result<Vec<_>, _>>()?;
         let last_non_empty = lines.iter().rposition(|line| !line.trim().is_empty());
@@ -72,5 +78,12 @@ impl AppendOnlyLog {
             }
         }
         Ok(events)
+    }
+
+    pub fn truncate(&mut self) -> Result<(), FlintError> {
+        self.file.set_len(0)?;
+        self.file.seek(SeekFrom::Start(0))?;
+        self.file.sync_all()?;
+        Ok(())
     }
 }

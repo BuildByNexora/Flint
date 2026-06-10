@@ -13,13 +13,17 @@ pub fn parse_duration(value: &str) -> Result<u64, FlintError> {
         .parse::<u64>()
         .map_err(|_| FlintError::InvalidDuration(value.to_string()))?;
     let multiplier = match suffix {
-        "" | "s" => 1,
-        "m" => 60,
-        "h" => 60 * 60,
-        "d" => 60 * 60 * 24,
+        "ms" => 1,
+        "" | "s" => 1_000,
+        "m" => 60_000,
+        "h" => 60 * 60_000,
+        "d" => 24 * 60 * 60_000,
         _ => return Err(FlintError::InvalidDuration(value.to_string())),
     };
-    Ok(number * multiplier)
+    number
+        .checked_mul(multiplier)
+        .filter(|value| *value > 0)
+        .ok_or_else(|| FlintError::InvalidDuration(value.to_string()))
 }
 
 #[cfg(test)]
@@ -28,10 +32,11 @@ mod tests {
 
     #[test]
     fn parses_duration_suffixes() {
-        assert_eq!(parse_duration("10s").unwrap(), 10);
-        assert_eq!(parse_duration("1m").unwrap(), 60);
-        assert_eq!(parse_duration("2h").unwrap(), 7200);
-        assert_eq!(parse_duration("1d").unwrap(), 86400);
-        assert!(parse_duration("100ms").is_err());
+        assert_eq!(parse_duration("100ms").unwrap(), 100);
+        assert_eq!(parse_duration("10s").unwrap(), 10_000);
+        assert_eq!(parse_duration("1m").unwrap(), 60_000);
+        assert_eq!(parse_duration("2h").unwrap(), 7_200_000);
+        assert_eq!(parse_duration("1d").unwrap(), 86_400_000);
+        assert!(parse_duration("0ms").is_err());
     }
 }
