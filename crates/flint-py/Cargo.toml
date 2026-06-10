@@ -1,0 +1,16 @@
+[package]
+name = "flint-py"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+
+[lib]
+name = "flint"
+crate-type = ["cdylib"]
+
+[dependencies]
+flint-core.workspace = true
+pyo3.workspace = true
+serde_json.workspace = true

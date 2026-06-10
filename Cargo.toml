@@ -1,0 +1,25 @@
+[workspace]
+members = [
+    "crates/flint-core",
+    "crates/flint-py",
+    "crates/flint-cli",
+]
+resolver = "2"
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "BSD-3-Clause"
+authors = ["BuildByNexora"]
+repository = "https://github.com/BuildByNexora/Flint"
+
+[workspace.dependencies]
+chrono = { version = "0.4", features = ["serde"] }
+clap = { version = "4", features = ["derive"] }
+fs2 = "0.4"
+flint-core = { path = "crates/flint-core" }
+pyo3 = { version = "0.22", features = ["extension-module"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "1"
+uuid = { version = "1", features = ["v4"] }
