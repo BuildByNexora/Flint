@@ -11,6 +11,9 @@ name = "flint"
 path = "src/main.rs"
 
 [dependencies]
+axum = "0.7"
 clap.workspace = true
 flint-core.workspace = true
+serde = { workspace = true, features = ["derive"] }
 serde_json.workspace = true
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "signal"] }

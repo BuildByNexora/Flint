@@ -5,3 +5,7 @@
 /wheel-test/
 __pycache__/
 .flint/
+*.so
+*.pyd
+*.dll
+*.dylib

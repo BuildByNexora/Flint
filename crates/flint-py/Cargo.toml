@@ -7,7 +7,7 @@ authors.workspace = true
 repository.workspace = true
 
 [lib]
-name = "flint"
+name = "_native"
 crate-type = ["cdylib"]
 
 [dependencies]

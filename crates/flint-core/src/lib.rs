@@ -10,6 +10,7 @@ use std::sync::Mutex;
 use chrono::{DateTime, Duration, Utc};
 use fs2::FileExt;
 use serde::{de, Deserialize, Deserializer, Serialize};
+use sha2::{Digest, Sha256};
 use thiserror::Error;
 
 pub use parse::parse_duration;
@@ -35,6 +36,8 @@ pub enum FlintError {
         line: usize,
         source: serde_json::Error,
     },
+    #[error("storage integrity error: {0}")]
+    StorageIntegrity(String),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -104,9 +107,23 @@ impl<'de> Deserialize<'de> for LimitConfig {
 pub struct CheckResult {
     pub key: String,
     pub allowed: bool,
+    pub cost: u64,
     pub remaining: u64,
     pub reset_at: DateTime<Utc>,
     pub algorithm: Algorithm,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MultiCheckItem {
+    pub key: String,
+    pub cost: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MultiCheckResult {
+    pub allowed: bool,
+    pub denied_key: Option<String>,
+    pub results: Vec<CheckResult>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -119,6 +136,8 @@ pub struct LimitSummary {
     pub reset_at: DateTime<Utc>,
     pub total_allowed: u64,
     pub total_denied: u64,
+    pub total_allowed_cost: u64,
+    pub total_denied_cost: u64,
     pub last_allowed_at: Option<DateTime<Utc>>,
     pub last_denied_at: Option<DateTime<Utc>>,
     pub last_reset_at: Option<DateTime<Utc>>,
@@ -127,10 +146,29 @@ pub struct LimitSummary {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "SCREAMING_SNAKE_CASE")]
 pub enum Event {
-    LimitConfigured { config: LimitConfig },
-    Allow { key: String, at: DateTime<Utc> },
-    Deny { key: String, at: DateTime<Utc> },
-    Reset { key: String, at: DateTime<Utc> },
+    LimitConfigured {
+        config: LimitConfig,
+    },
+    Allow {
+        key: String,
+        at: DateTime<Utc>,
+        #[serde(default = "default_cost")]
+        cost: u64,
+    },
+    AllowAll {
+        items: Vec<MultiCheckItem>,
+        at: DateTime<Utc>,
+    },
+    Deny {
+        key: String,
+        at: DateTime<Utc>,
+        #[serde(default = "default_cost")]
+        cost: u64,
+    },
+    Reset {
+        key: String,
+        at: DateTime<Utc>,
+    },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -149,6 +187,8 @@ struct FixedWindowState {
 pub struct LimitMetrics {
     pub total_allowed: u64,
     pub total_denied: u64,
+    pub total_allowed_cost: u64,
+    pub total_denied_cost: u64,
     pub last_allowed_at: Option<DateTime<Utc>>,
     pub last_denied_at: Option<DateTime<Utc>>,
     pub last_reset_at: Option<DateTime<Utc>>,
@@ -192,6 +232,14 @@ struct Snapshot {
     created_at: DateTime<Utc>,
     aof_offset: u64,
     state: State,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct SnapshotEnvelope {
+    format_version: u32,
+    created_at: DateTime<Utc>,
+    checksum: String,
+    snapshot: String,
 }
 
 const SNAPSHOT_FORMAT_VERSION: u32 = 1;
@@ -283,10 +331,30 @@ impl Limiter {
     }
 
     pub fn allow(&self, key: &str) -> Result<bool, FlintError> {
-        Ok(self.check(key)?.allowed)
+        self.allow_cost(key, 1)
+    }
+
+    pub fn allow_cost(&self, key: &str, cost: u64) -> Result<bool, FlintError> {
+        Ok(self.check_cost(key, cost)?.allowed)
+    }
+
+    pub fn allow_all(&self, keys: &[String]) -> Result<bool, FlintError> {
+        let items = keys
+            .iter()
+            .map(|key| MultiCheckItem {
+                key: key.clone(),
+                cost: 1,
+            })
+            .collect::<Vec<_>>();
+        Ok(self.check_all(items)?.allowed)
     }
 
     pub fn check(&self, key: &str) -> Result<CheckResult, FlintError> {
+        self.check_cost(key, 1)
+    }
+
+    pub fn check_cost(&self, key: &str, cost: u64) -> Result<CheckResult, FlintError> {
+        validate_cost(cost)?;
         let now = Utc::now();
         let mut log = self.log.lock().expect("limiter log lock poisoned");
         let mut state = self.state.lock().expect("limiter state lock poisoned");
@@ -295,25 +363,97 @@ impl Limiter {
             .get(key)
             .cloned()
             .ok_or_else(|| FlintError::LimitNotConfigured(key.to_string()))?;
+        validate_cost_for_config(cost, &config)?;
         let result = match config.algorithm {
-            Algorithm::TokenBucket => check_token_bucket_preview(&mut state, &config, now),
-            Algorithm::SlidingWindowLog => check_sliding_window_preview(&mut state, &config, now),
-            Algorithm::FixedWindowCounter => check_fixed_window_preview(&mut state, &config, now),
+            Algorithm::TokenBucket => check_token_bucket_preview(&mut state, &config, now, cost),
+            Algorithm::SlidingWindowLog => {
+                check_sliding_window_preview(&mut state, &config, now, cost)
+            }
+            Algorithm::FixedWindowCounter => {
+                check_fixed_window_preview(&mut state, &config, now, cost)
+            }
         };
         let event = if result.allowed {
             Event::Allow {
                 key: key.to_string(),
                 at: now,
+                cost,
             }
         } else {
             Event::Deny {
                 key: key.to_string(),
                 at: now,
+                cost,
             }
         };
         log.append(&event)?;
         apply_event(&mut state, event);
         Ok(result)
+    }
+
+    pub fn check_all(&self, items: Vec<MultiCheckItem>) -> Result<MultiCheckResult, FlintError> {
+        validate_multi_items(&items)?;
+        let now = Utc::now();
+        let mut log = self.log.lock().expect("limiter log lock poisoned");
+        let mut state = self.state.lock().expect("limiter state lock poisoned");
+        let mut preview_state = state.clone();
+        let mut results = Vec::with_capacity(items.len());
+
+        for item in &items {
+            validate_cost(item.cost)?;
+            let config = preview_state
+                .configs
+                .get(&item.key)
+                .cloned()
+                .ok_or_else(|| FlintError::LimitNotConfigured(item.key.clone()))?;
+            validate_cost_for_config(item.cost, &config)?;
+            let result = preview_check(&mut preview_state, &config, now, item.cost);
+            if result.allowed {
+                apply_consumption(&mut preview_state, &item.key, now, item.cost);
+            }
+            results.push(result);
+            if results.last().is_some_and(|result| !result.allowed) {
+                break;
+            }
+        }
+
+        let denied_key = results
+            .iter()
+            .find(|result| !result.allowed)
+            .map(|result| result.key.clone());
+
+        if let Some(denied_key) = denied_key {
+            let denied_cost = items
+                .iter()
+                .find(|item| item.key == denied_key)
+                .map(|item| item.cost)
+                .unwrap_or(1);
+            let event = Event::Deny {
+                key: denied_key.clone(),
+                at: now,
+                cost: denied_cost,
+            };
+            log.append(&event)?;
+            apply_event(&mut state, event);
+            return Ok(MultiCheckResult {
+                allowed: false,
+                denied_key: Some(denied_key),
+                results,
+            });
+        }
+
+        let event = Event::AllowAll {
+            items: items.clone(),
+            at: now,
+        };
+        log.append(&event)?;
+        apply_event(&mut state, event);
+
+        Ok(MultiCheckResult {
+            allowed: true,
+            denied_key: None,
+            results,
+        })
     }
 
     pub fn reset(&self, key: &str) -> Result<(), FlintError> {
@@ -353,7 +493,7 @@ impl Limiter {
         Ok(state
             .history
             .iter()
-            .filter(|event| event_key(event).is_some_and(|candidate| candidate == key))
+            .filter(|event| event_matches_key(event, key))
             .cloned()
             .collect())
     }
@@ -431,6 +571,7 @@ fn check_token_bucket_preview(
     state: &mut State,
     config: &LimitConfig,
     now: DateTime<Utc>,
+    cost: u64,
 ) -> CheckResult {
     let mut bucket = state
         .buckets
@@ -441,11 +582,24 @@ fn check_token_bucket_preview(
             last_refill: now,
         });
     refill_bucket(&mut bucket, config, now);
-    let allowed = bucket.tokens >= 1.0;
+    let allowed = bucket.tokens >= cost as f64;
     if allowed {
-        bucket.tokens -= 1.0;
+        bucket.tokens -= cost as f64;
     }
-    token_bucket_result(config, &bucket, allowed, now)
+    token_bucket_result(config, &bucket, allowed, cost, now)
+}
+
+fn preview_check(
+    state: &mut State,
+    config: &LimitConfig,
+    now: DateTime<Utc>,
+    cost: u64,
+) -> CheckResult {
+    match config.algorithm {
+        Algorithm::TokenBucket => check_token_bucket_preview(state, config, now, cost),
+        Algorithm::SlidingWindowLog => check_sliding_window_preview(state, config, now, cost),
+        Algorithm::FixedWindowCounter => check_fixed_window_preview(state, config, now, cost),
+    }
 }
 
 fn summary_for(state: &mut State, config: &LimitConfig, now: DateTime<Utc>) -> LimitSummary {
@@ -459,10 +613,10 @@ fn summary_for(state: &mut State, config: &LimitConfig, now: DateTime<Utc>) -> L
                     last_refill: now,
                 });
             refill_bucket(bucket, config, now);
-            token_bucket_result(config, bucket, true, now)
+            token_bucket_result(config, bucket, true, 0, now)
         }
-        Algorithm::SlidingWindowLog => check_sliding_window_preview(state, config, now),
-        Algorithm::FixedWindowCounter => check_fixed_window_preview(state, config, now),
+        Algorithm::SlidingWindowLog => check_sliding_window_preview(state, config, now, 0),
+        Algorithm::FixedWindowCounter => check_fixed_window_preview(state, config, now, 0),
     };
     let metrics = state.metrics.get(&config.key).cloned().unwrap_or_default();
     LimitSummary {
@@ -474,6 +628,8 @@ fn summary_for(state: &mut State, config: &LimitConfig, now: DateTime<Utc>) -> L
         reset_at: result.reset_at,
         total_allowed: metrics.total_allowed,
         total_denied: metrics.total_denied,
+        total_allowed_cost: metrics.total_allowed_cost,
+        total_denied_cost: metrics.total_denied_cost,
         last_allowed_at: metrics.last_allowed_at,
         last_denied_at: metrics.last_denied_at,
         last_reset_at: metrics.last_reset_at,
@@ -484,6 +640,7 @@ fn check_sliding_window_preview(
     state: &mut State,
     config: &LimitConfig,
     now: DateTime<Utc>,
+    cost: u64,
 ) -> CheckResult {
     let cutoff = now - duration_ms(config.per_millis);
     let mut entries = state
@@ -498,10 +655,18 @@ fn check_sliding_window_preview(
         .front()
         .map(|first| *first + duration_ms(config.per_millis))
         .unwrap_or(now + duration_ms(config.per_millis));
+    let used = entries.len() as u64;
+    let allowed = used.saturating_add(cost) <= config.rate;
+    let remaining = if allowed {
+        config.rate.saturating_sub(used.saturating_add(cost))
+    } else {
+        config.rate.saturating_sub(used)
+    };
     CheckResult {
         key: config.key.clone(),
-        allowed: entries.len() < config.rate as usize,
-        remaining: config.rate.saturating_sub(entries.len() as u64),
+        allowed,
+        cost,
+        remaining,
         reset_at,
         algorithm: config.algorithm,
     }
@@ -511,6 +676,7 @@ fn check_fixed_window_preview(
     state: &mut State,
     config: &LimitConfig,
     now: DateTime<Utc>,
+    cost: u64,
 ) -> CheckResult {
     let per = duration_ms(config.per_millis);
     let mut window = state
@@ -525,10 +691,18 @@ fn check_fixed_window_preview(
         window.window_start = now;
         window.count = 0;
     }
+    let used = window.count;
+    let allowed = used.saturating_add(cost) <= config.rate;
+    let remaining = if allowed {
+        config.rate.saturating_sub(used.saturating_add(cost))
+    } else {
+        config.rate.saturating_sub(used)
+    };
     CheckResult {
         key: config.key.clone(),
-        allowed: window.count < config.rate,
-        remaining: config.rate.saturating_sub(window.count),
+        allowed,
+        cost,
+        remaining,
         reset_at: window.window_start + per,
         algorithm: config.algorithm,
     }
@@ -548,6 +722,7 @@ fn token_bucket_result(
     config: &LimitConfig,
     bucket: &BucketState,
     allowed: bool,
+    cost: u64,
     now: DateTime<Utc>,
 ) -> CheckResult {
     let missing = (config.rate as f64 - bucket.tokens).max(0.0);
@@ -555,6 +730,7 @@ fn token_bucket_result(
     CheckResult {
         key: config.key.clone(),
         allowed,
+        cost,
         remaining: bucket.tokens.floor() as u64,
         reset_at: now + Duration::milliseconds(millis_to_full.max(0)),
         algorithm: config.algorithm,
@@ -567,15 +743,26 @@ fn apply_event(state: &mut State, event: Event) {
             state.metrics.entry(config.key.clone()).or_default();
             state.configs.insert(config.key.clone(), config);
         }
-        Event::Allow { key, at } => {
+        Event::Allow { key, at, cost } => {
             let metrics = state.metrics.entry(key.clone()).or_default();
             metrics.total_allowed += 1;
+            metrics.total_allowed_cost = metrics.total_allowed_cost.saturating_add(cost);
             metrics.last_allowed_at = Some(at);
-            apply_consumption(state, &key, at);
+            apply_consumption(state, &key, at, cost);
         }
-        Event::Deny { key, at } => {
+        Event::AllowAll { items, at } => {
+            for item in items {
+                let metrics = state.metrics.entry(item.key.clone()).or_default();
+                metrics.total_allowed += 1;
+                metrics.total_allowed_cost = metrics.total_allowed_cost.saturating_add(item.cost);
+                metrics.last_allowed_at = Some(at);
+                apply_consumption(state, &item.key, at, item.cost);
+            }
+        }
+        Event::Deny { key, at, cost } => {
             let metrics = state.metrics.entry(key).or_default();
             metrics.total_denied += 1;
+            metrics.total_denied_cost = metrics.total_denied_cost.saturating_add(cost);
             metrics.last_denied_at = Some(at);
         }
         Event::Reset { key, at } => {
@@ -595,7 +782,7 @@ fn apply_event(state: &mut State, event: Event) {
     state.history.push(event);
 }
 
-fn apply_consumption(state: &mut State, key: &str, at: DateTime<Utc>) {
+fn apply_consumption(state: &mut State, key: &str, at: DateTime<Utc>, cost: u64) {
     let Some(config) = state.configs.get(key).cloned() else {
         return;
     };
@@ -606,8 +793,8 @@ fn apply_consumption(state: &mut State, key: &str, at: DateTime<Utc>) {
                 last_refill: at,
             });
             refill_bucket(bucket, &config, at);
-            if bucket.tokens >= 1.0 {
-                bucket.tokens -= 1.0;
+            if bucket.tokens >= cost as f64 {
+                bucket.tokens -= cost as f64;
             }
         }
         Algorithm::SlidingWindowLog => {
@@ -616,7 +803,9 @@ fn apply_consumption(state: &mut State, key: &str, at: DateTime<Utc>) {
             while entries.front().is_some_and(|value| *value <= cutoff) {
                 entries.pop_front();
             }
-            entries.push_back(at);
+            for _ in 0..cost {
+                entries.push_back(at);
+            }
         }
         Algorithm::FixedWindowCounter => {
             let per = duration_ms(config.per_millis);
@@ -631,7 +820,7 @@ fn apply_consumption(state: &mut State, key: &str, at: DateTime<Utc>) {
                 window.window_start = at;
                 window.count = 0;
             }
-            window.count += 1;
+            window.count = window.count.saturating_add(cost);
         }
     }
 }
@@ -640,7 +829,61 @@ fn event_key(event: &Event) -> Option<&str> {
     match event {
         Event::LimitConfigured { config } => Some(&config.key),
         Event::Allow { key, .. } | Event::Deny { key, .. } | Event::Reset { key, .. } => Some(key),
+        Event::AllowAll { .. } => None,
     }
+}
+
+fn event_matches_key(event: &Event, key: &str) -> bool {
+    match event {
+        Event::AllowAll { items, .. } => items.iter().any(|item| item.key == key),
+        _ => event_key(event).is_some_and(|candidate| candidate == key),
+    }
+}
+
+fn default_cost() -> u64 {
+    1
+}
+
+fn validate_cost(cost: u64) -> Result<(), FlintError> {
+    if cost == 0 {
+        return Err(FlintError::InvalidDuration(
+            "cost must be greater than zero".into(),
+        ));
+    }
+    Ok(())
+}
+
+fn validate_cost_for_config(cost: u64, config: &LimitConfig) -> Result<(), FlintError> {
+    if cost > config.rate {
+        return Err(FlintError::InvalidDuration(format!(
+            "cost {cost} exceeds configured rate capacity {}",
+            config.rate
+        )));
+    }
+    Ok(())
+}
+
+fn validate_multi_items(items: &[MultiCheckItem]) -> Result<(), FlintError> {
+    if items.is_empty() {
+        return Err(FlintError::InvalidDuration(
+            "allow_all requires at least one limit key".into(),
+        ));
+    }
+    let mut seen = std::collections::HashSet::new();
+    for item in items {
+        if item.key.trim().is_empty() {
+            return Err(FlintError::InvalidDuration(
+                "limit key must not be empty".into(),
+            ));
+        }
+        if !seen.insert(item.key.as_str()) {
+            return Err(FlintError::InvalidDuration(format!(
+                "duplicate limit key in allow_all: {}",
+                item.key
+            )));
+        }
+    }
+    Ok(())
 }
 
 fn duration_ms(ms: u64) -> Duration {
@@ -663,11 +906,29 @@ fn read_snapshot(data_dir: &Path) -> Result<Option<(State, u64)>, FlintError> {
     if !path.exists() {
         return Ok(None);
     }
-    let snapshot: Snapshot = serde_json::from_slice(&std::fs::read(path)?)?;
+    let bytes = std::fs::read(path)?;
+    let value: serde_json::Value = serde_json::from_slice(&bytes)?;
+    let snapshot: Snapshot = if looks_like_snapshot_envelope(&value) {
+        let envelope: SnapshotEnvelope = serde_json::from_value(value)?;
+        if envelope.format_version != SNAPSHOT_FORMAT_VERSION {
+            return Err(FlintError::UnsupportedSnapshot(envelope.format_version));
+        }
+        verify_snapshot_checksum(&envelope)?;
+        serde_json::from_str(&envelope.snapshot)?
+    } else {
+        serde_json::from_value(value)?
+    };
     if snapshot.format_version != SNAPSHOT_FORMAT_VERSION {
         return Err(FlintError::UnsupportedSnapshot(snapshot.format_version));
     }
     Ok(Some((snapshot.state, snapshot.aof_offset)))
+}
+
+fn looks_like_snapshot_envelope(value: &serde_json::Value) -> bool {
+    value
+        .as_object()
+        .map(|object| object.contains_key("checksum") || object.contains_key("snapshot"))
+        .unwrap_or(false)
 }
 
 fn write_snapshot(data_dir: &Path, snapshot: &Snapshot) -> Result<(), FlintError> {
@@ -677,12 +938,85 @@ fn write_snapshot(data_dir: &Path, snapshot: &Snapshot) -> Result<(), FlintError
         .write(true)
         .truncate(true)
         .open(&tmp)?;
-    serde_json::to_writer_pretty(&mut file, snapshot)?;
+    let snapshot_json = canonical_snapshot_json(snapshot)?;
+    let envelope = SnapshotEnvelope {
+        format_version: SNAPSHOT_FORMAT_VERSION,
+        created_at: Utc::now(),
+        checksum: snapshot_string_checksum(&snapshot_json),
+        snapshot: snapshot_json,
+    };
+    serde_json::to_writer_pretty(&mut file, &envelope)?;
     file.write_all(b"\n")?;
     file.sync_all()?;
     std::fs::rename(&tmp, snapshot_path(data_dir))?;
     File::open(data_dir)?.sync_all()?;
     Ok(())
+}
+
+fn verify_snapshot_checksum(envelope: &SnapshotEnvelope) -> Result<(), FlintError> {
+    let actual = snapshot_string_checksum(&envelope.snapshot);
+    if !constant_time_eq(envelope.checksum.as_bytes(), actual.as_bytes()) {
+        return Err(FlintError::StorageIntegrity(format!(
+            "snapshot checksum mismatch: expected {}, got {}",
+            envelope.checksum, actual
+        )));
+    }
+    Ok(())
+}
+
+fn canonical_snapshot_json(snapshot: &Snapshot) -> Result<String, FlintError> {
+    let mut value = serde_json::to_value(snapshot)?;
+    canonicalize_json(&mut value);
+    Ok(serde_json::to_string(&value)?)
+}
+
+fn snapshot_string_checksum(value: &str) -> String {
+    hex_sha256(value.as_bytes())
+}
+
+fn canonicalize_json(value: &mut serde_json::Value) {
+    match value {
+        serde_json::Value::Array(values) => {
+            for value in values {
+                canonicalize_json(value);
+            }
+        }
+        serde_json::Value::Object(values) => {
+            let mut sorted = values
+                .iter_mut()
+                .map(|(key, value)| {
+                    canonicalize_json(value);
+                    (key.clone(), value.take())
+                })
+                .collect::<Vec<_>>();
+            sorted.sort_by(|left, right| left.0.cmp(&right.0));
+            values.clear();
+            for (key, value) in sorted {
+                values.insert(key, value);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn hex_sha256(bytes: &[u8]) -> String {
+    let digest = Sha256::digest(bytes);
+    let mut out = String::with_capacity(digest.len() * 2);
+    for byte in digest {
+        use std::fmt::Write as _;
+        let _ = write!(out, "{byte:02x}");
+    }
+    out
+}
+
+fn constant_time_eq(left: &[u8], right: &[u8]) -> bool {
+    if left.len() != right.len() {
+        return false;
+    }
+    left.iter()
+        .zip(right)
+        .fold(0_u8, |acc, (left, right)| acc | (left ^ right))
+        == 0
 }
 
 #[cfg(test)]
@@ -785,6 +1119,155 @@ mod tests {
     }
 
     #[test]
+    fn token_bucket_supports_cost_based_checks() {
+        let dir = TempDir::new().unwrap();
+        let limiter = Limiter::open(dir.path()).unwrap();
+        limiter
+            .limit("tokens", 5, "1m", Algorithm::TokenBucket)
+            .unwrap();
+
+        let first = limiter.check_cost("tokens", 3).unwrap();
+        assert!(first.allowed);
+        assert_eq!(first.cost, 3);
+        assert_eq!(first.remaining, 2);
+
+        let denied = limiter.check_cost("tokens", 3).unwrap();
+        assert!(!denied.allowed);
+        assert_eq!(denied.remaining, 2);
+        assert!(matches!(
+            limiter.check_cost("tokens", 6),
+            Err(FlintError::InvalidDuration(_))
+        ));
+
+        drop(limiter);
+        let limiter = Limiter::open(dir.path()).unwrap();
+        let status = limiter.status("tokens").unwrap().unwrap();
+        assert_eq!(status.remaining, 2);
+        assert_eq!(status.total_allowed, 1);
+        assert_eq!(status.total_denied, 1);
+        assert_eq!(status.total_allowed_cost, 3);
+        assert_eq!(status.total_denied_cost, 3);
+    }
+
+    #[test]
+    fn fixed_and_sliding_windows_apply_cost() {
+        let dir = TempDir::new().unwrap();
+        let limiter = Limiter::open(dir.path()).unwrap();
+        limiter
+            .limit("fixed", 5, "1m", Algorithm::FixedWindowCounter)
+            .unwrap();
+        limiter
+            .limit("sliding", 5, "1m", Algorithm::SlidingWindowLog)
+            .unwrap();
+
+        assert!(limiter.check_cost("fixed", 4).unwrap().allowed);
+        assert!(!limiter.check_cost("fixed", 2).unwrap().allowed);
+        assert!(limiter.check_cost("sliding", 4).unwrap().allowed);
+        assert!(!limiter.check_cost("sliding", 2).unwrap().allowed);
+    }
+
+    #[test]
+    fn zero_cost_is_rejected() {
+        let dir = TempDir::new().unwrap();
+        let limiter = Limiter::open(dir.path()).unwrap();
+        limiter.limit("x", 1, "1m", Algorithm::TokenBucket).unwrap();
+        assert!(matches!(
+            limiter.check_cost("x", 0),
+            Err(FlintError::InvalidDuration(_))
+        ));
+    }
+
+    #[test]
+    fn check_all_consumes_all_limits_when_everything_passes() {
+        let dir = TempDir::new().unwrap();
+        let limiter = Limiter::open(dir.path()).unwrap();
+        limiter
+            .limit("user", 2, "1m", Algorithm::TokenBucket)
+            .unwrap();
+        limiter
+            .limit("org", 10, "1m", Algorithm::TokenBucket)
+            .unwrap();
+
+        let result = limiter
+            .check_all(vec![
+                MultiCheckItem {
+                    key: "user".into(),
+                    cost: 1,
+                },
+                MultiCheckItem {
+                    key: "org".into(),
+                    cost: 7,
+                },
+            ])
+            .unwrap();
+
+        assert!(result.allowed);
+        assert_eq!(result.denied_key, None);
+        assert_eq!(limiter.status("user").unwrap().unwrap().remaining, 1);
+        assert_eq!(limiter.status("org").unwrap().unwrap().remaining, 3);
+        assert_eq!(limiter.history("user").unwrap().len(), 2);
+        assert_eq!(limiter.history("org").unwrap().len(), 2);
+        drop(limiter);
+
+        let limiter = Limiter::open(dir.path()).unwrap();
+        assert_eq!(limiter.status("user").unwrap().unwrap().remaining, 1);
+        assert_eq!(limiter.status("org").unwrap().unwrap().remaining, 3);
+    }
+
+    #[test]
+    fn check_all_does_not_partially_consume_when_one_limit_denies() {
+        let dir = TempDir::new().unwrap();
+        let limiter = Limiter::open(dir.path()).unwrap();
+        limiter
+            .limit("user", 1, "1m", Algorithm::TokenBucket)
+            .unwrap();
+        limiter
+            .limit("org", 10, "1m", Algorithm::TokenBucket)
+            .unwrap();
+        assert!(limiter.allow("user").unwrap());
+
+        let result = limiter
+            .check_all(vec![
+                MultiCheckItem {
+                    key: "user".into(),
+                    cost: 1,
+                },
+                MultiCheckItem {
+                    key: "org".into(),
+                    cost: 7,
+                },
+            ])
+            .unwrap();
+
+        assert!(!result.allowed);
+        assert_eq!(result.denied_key.as_deref(), Some("user"));
+        assert_eq!(result.results.len(), 1);
+        assert_eq!(limiter.status("org").unwrap().unwrap().remaining, 10);
+        assert_eq!(limiter.status("org").unwrap().unwrap().total_allowed, 0);
+        assert_eq!(limiter.status("user").unwrap().unwrap().total_denied, 1);
+    }
+
+    #[test]
+    fn check_all_rejects_duplicate_keys() {
+        let dir = TempDir::new().unwrap();
+        let limiter = Limiter::open(dir.path()).unwrap();
+        limiter.limit("x", 1, "1m", Algorithm::TokenBucket).unwrap();
+        assert!(matches!(
+            limiter.check_all(vec![
+                MultiCheckItem {
+                    key: "x".into(),
+                    cost: 1,
+                },
+                MultiCheckItem {
+                    key: "x".into(),
+                    cost: 1,
+                },
+            ]),
+            Err(FlintError::InvalidDuration(_))
+        ));
+    }
+
+    #[test]
     fn legacy_per_seconds_log_entries_are_migrated_to_millis() {
         let dir = TempDir::new().unwrap();
         std::fs::create_dir_all(dir.path()).unwrap();
@@ -813,6 +1296,131 @@ mod tests {
         match Limiter::open(dir.path()) {
             Err(FlintError::CorruptLog { .. }) => {}
             Ok(_) => panic!("corrupt log unexpectedly opened"),
+            Err(err) => panic!("unexpected error: {err}"),
+        }
+    }
+
+    #[test]
+    fn aof_checksum_mismatch_is_fatal() {
+        let dir = TempDir::new().unwrap();
+        let limiter = Limiter::open(dir.path()).unwrap();
+        limiter.limit("x", 1, "1m", Algorithm::TokenBucket).unwrap();
+        drop(limiter);
+
+        let path = dir.path().join("flint.aof");
+        let contents = std::fs::read_to_string(&path)
+            .unwrap()
+            .replace("\"rate\":1", "\"rate\":2");
+        std::fs::write(&path, contents).unwrap();
+
+        match Limiter::open(dir.path()) {
+            Err(FlintError::StorageIntegrity(message)) => {
+                assert!(message.contains("AOF checksum mismatch"));
+            }
+            Ok(_) => panic!("tampered AOF unexpectedly opened"),
+            Err(err) => panic!("unexpected error: {err}"),
+        }
+    }
+
+    #[test]
+    fn aof_checksummed_record_requires_format_version() {
+        let dir = TempDir::new().unwrap();
+        let limiter = Limiter::open(dir.path()).unwrap();
+        limiter.limit("x", 1, "1m", Algorithm::TokenBucket).unwrap();
+        drop(limiter);
+
+        let path = dir.path().join("flint.aof");
+        let contents = std::fs::read_to_string(&path)
+            .unwrap()
+            .replace("\"version\":1,", "");
+        std::fs::write(&path, contents).unwrap();
+
+        match Limiter::open(dir.path()) {
+            Err(FlintError::StorageIntegrity(message)) => {
+                assert!(message.contains("missing format version"));
+            }
+            Ok(_) => panic!("AOF with missing version unexpectedly opened"),
+            Err(err) => panic!("unexpected error: {err}"),
+        }
+    }
+
+    #[test]
+    fn aof_checksummed_record_rejects_future_format_version() {
+        let dir = TempDir::new().unwrap();
+        let limiter = Limiter::open(dir.path()).unwrap();
+        limiter.limit("x", 1, "1m", Algorithm::TokenBucket).unwrap();
+        drop(limiter);
+
+        let path = dir.path().join("flint.aof");
+        let contents = std::fs::read_to_string(&path)
+            .unwrap()
+            .replace("\"version\":1", "\"version\":999");
+        std::fs::write(&path, contents).unwrap();
+
+        match Limiter::open(dir.path()) {
+            Err(FlintError::StorageIntegrity(message)) => {
+                assert!(message.contains("unsupported AOF format version 999"));
+            }
+            Ok(_) => panic!("AOF with future version unexpectedly opened"),
+            Err(err) => panic!("unexpected error: {err}"),
+        }
+    }
+
+    #[test]
+    fn snapshot_checksum_mismatch_is_fatal() {
+        let dir = TempDir::new().unwrap();
+        let limiter = Limiter::open(dir.path()).unwrap();
+        limiter.limit("x", 1, "1m", Algorithm::TokenBucket).unwrap();
+        limiter.compact().unwrap();
+        drop(limiter);
+
+        let path = dir.path().join("flint.snapshot");
+        let contents = std::fs::read_to_string(&path)
+            .unwrap()
+            .replace("\\\"rate\\\":1", "\\\"rate\\\":2");
+        assert_ne!(contents, std::fs::read_to_string(&path).unwrap());
+        std::fs::write(&path, contents).unwrap();
+
+        match Limiter::open(dir.path()) {
+            Err(FlintError::StorageIntegrity(message)) => {
+                assert!(message.contains("snapshot checksum mismatch"));
+            }
+            Ok(_) => panic!("tampered snapshot unexpectedly opened"),
+            Err(err) => panic!("unexpected error: {err}"),
+        }
+    }
+
+    #[test]
+    fn malformed_snapshot_envelope_does_not_fallback_to_legacy_snapshot() {
+        let dir = TempDir::new().unwrap();
+        let limiter = Limiter::open(dir.path()).unwrap();
+        limiter.limit("x", 1, "1m", Algorithm::TokenBucket).unwrap();
+        limiter.compact().unwrap();
+        drop(limiter);
+
+        let malformed_envelope = serde_json::json!({
+            "format_version": 1,
+            "created_at": "2026-06-10T08:00:00Z",
+            "checksum": "abc",
+            "aof_offset": 0,
+            "state": {
+                "configs": {},
+                "buckets": {},
+                "fixed": {},
+                "sliding": {},
+                "history": {},
+                "metrics": {}
+            }
+        });
+        std::fs::write(
+            dir.path().join("flint.snapshot"),
+            serde_json::to_vec(&malformed_envelope).unwrap(),
+        )
+        .unwrap();
+
+        match Limiter::open(dir.path()) {
+            Ok(_) => panic!("malformed snapshot envelope unexpectedly opened"),
+            Err(FlintError::Json(_)) => {}
             Err(err) => panic!("unexpected error: {err}"),
         }
     }

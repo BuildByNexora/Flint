@@ -27,6 +27,7 @@ def test_check_result_has_context(tmp_path):
     limiter.limit("x", rate=1, per="1m", algorithm="token_bucket")
     result = limiter.check("x")
     assert result.allowed is True
+    assert result.cost == 1
     assert result.remaining == 0
     assert result.reset_at
 
@@ -59,6 +60,63 @@ def test_decorator_raises_rate_limit_exceeded(tmp_path):
     assert exc.value.key == "decorated"
     assert exc.value.remaining == 0
     assert calls == [3]
+
+
+def test_cost_based_check_and_decorator(tmp_path):
+    limiter = flint.Limiter(data_dir=str(tmp_path))
+    limiter.limit("ai:user-42", rate=10, per="1m")
+
+    result = limiter.check("ai:user-42", cost=7)
+    assert result.allowed is True
+    assert result.cost == 7
+    assert result.remaining == 3
+    assert limiter.allow("ai:user-42", cost=4) is False
+    with pytest.raises(ValueError):
+        limiter.check("ai:user-42", cost=11)
+    status = limiter.status("ai:user-42")
+    assert status["total_allowed_cost"] == 7
+    assert status["total_denied_cost"] == 4
+
+    calls = []
+
+    @limiter.rate_limit("expensive", rate=5, per="1m", cost=3)
+    def expensive():
+        calls.append("ok")
+
+    expensive()
+    with pytest.raises(flint.RateLimitExceeded) as exc:
+        expensive()
+    assert exc.value.cost == 3
+    assert calls == ["ok"]
+
+
+def test_multi_limit_check_all_is_atomic(tmp_path):
+    limiter = flint.Limiter(data_dir=str(tmp_path))
+    limiter.limit("user:42", rate=1, per="1m")
+    limiter.limit("org:acme", rate=10, per="1m")
+    limiter.limit("endpoint:/v1/chat", rate=5, per="1m")
+
+    result = limiter.check_all([
+        "user:42",
+        {"key": "org:acme", "cost": 4},
+        ("endpoint:/v1/chat", 2),
+    ])
+    assert result["allowed"] is True
+    assert result["denied_key"] is None
+    assert limiter.status("org:acme")["remaining"] == 6
+    assert limiter.status("endpoint:/v1/chat")["remaining"] == 3
+
+    denied = limiter.check_all([
+        "user:42",
+        {"key": "org:acme", "cost": 4},
+        ("endpoint:/v1/chat", 2),
+    ])
+    assert denied["allowed"] is False
+    assert denied["denied_key"] == "user:42"
+    assert len(denied["results"]) == 1
+    assert limiter.status("org:acme")["remaining"] == 6
+    assert limiter.status("endpoint:/v1/chat")["remaining"] == 3
+    assert limiter.allow_all(["user:42", "org:acme"]) is False
 
 
 def test_compact_doctor_top(tmp_path):

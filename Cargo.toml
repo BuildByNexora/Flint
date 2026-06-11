@@ -15,11 +15,12 @@ repository = "https://github.com/BuildByNexora/Flint"
 
 [workspace.dependencies]
 chrono = { version = "0.4", features = ["serde"] }
-clap = { version = "4", features = ["derive"] }
+clap = { version = "4", features = ["derive", "env"] }
 fs2 = "0.4"
 flint-core = { path = "crates/flint-core" }
 pyo3 = { version = "0.22", features = ["extension-module"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+sha2 = "0.10"
 thiserror = "1"
 uuid = { version = "1", features = ["v4"] }

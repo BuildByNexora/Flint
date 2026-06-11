@@ -24,6 +24,14 @@ Homepage = "https://github.com/BuildByNexora/Flint"
 Repository = "https://github.com/BuildByNexora/Flint"
 Issues = "https://github.com/BuildByNexora/Flint/issues"
 
+[project.optional-dependencies]
+fastapi = [
+    "fastapi>=0.100,<0.116",
+    "starlette>=0.27,<0.48",
+    "httpx>=0.24,<0.29",
+]
+
 [tool.maturin]
 manifest-path = "crates/flint-py/Cargo.toml"
-module-name = "flint"
+module-name = "flint._native"
+python-source = "python"
