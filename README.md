@@ -613,25 +613,25 @@ For a quick smoke run:
 cargo bench -p flint-core --bench limiter -- --quick
 ```
 
-Latest local quick run:
+Latest local full Criterion run:
 
 | Benchmark | Result |
 |---|---:|
-| token bucket persistent check | ~556 us |
-| sliding window persistent check | ~575 us |
-| fixed window persistent check | ~592 us |
-| cost-based token bucket check | ~569 us |
-| `check_all()` over 3 limits | ~552 us |
-| configure 1,000 keys | ~584 ms |
-| configure 10,000 keys | ~5.60 s |
-| reopen from 1,000 AOF events | ~4.59 ms |
-| reopen from 10,000 AOF events | ~43.0 ms |
-| compact 1,000 AOF events | ~31.3 ms |
-| compact 10,000 AOF events | ~347 ms |
+| token bucket persistent check | ~569 us |
+| sliding window persistent check | ~581 us |
+| fixed window persistent check | ~580 us |
+| cost-based token bucket check | ~570 us |
+| `check_all()` over 3 limits | ~654 us |
+| configure 1,000 keys | ~581 ms |
+| configure 10,000 keys | ~5.71 s |
+| reopen from 1,000 AOF events | ~5.53 ms |
+| reopen from 10,000 AOF events | ~50.8 ms |
+| compact 1,000 AOF events | ~33.5 ms |
+| compact 10,000 AOF events | ~354 ms |
 
-These numbers are from a local quick run and are mainly useful as a regression
-baseline. Full Criterion runs should be used when comparing releases or storage
-changes.
+These numbers are from a local full Criterion run and are mainly useful as a
+regression baseline. Hardware, filesystem, and sync mode can change absolute
+latency.
 
 ---
 
