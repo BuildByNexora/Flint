@@ -34,18 +34,18 @@ def wait_for_server(url, token):
     raise RuntimeError("flint server did not become ready")
 
 
-def test_shared_limiter_server_roundtrip(tmp_path):
-    port = free_port()
-    token = "test-secret"
-    server = f"http://127.0.0.1:{port}"
+def build_cli():
     root = Path(__file__).resolve().parents[2]
-    binary = root / "target" / "debug" / "flint"
     subprocess.run(["cargo", "build", "-p", "flint-cli"], cwd=root, check=True)
-    process = subprocess.Popen(
+    return root / "target" / "debug" / "flint"
+
+
+def start_server(binary, data_dir, port, token):
+    return subprocess.Popen(
         [
             str(binary),
             "--data-dir",
-            str(tmp_path),
+            str(data_dir),
             "server",
             "start",
             "--bind",
@@ -57,6 +57,23 @@ def test_shared_limiter_server_roundtrip(tmp_path):
         stderr=subprocess.PIPE,
         text=True,
     )
+
+
+def stop_server(process):
+    process.terminate()
+    try:
+        process.wait(timeout=5)
+    except subprocess.TimeoutExpired:
+        process.kill()
+        process.wait(timeout=5)
+
+
+def test_shared_limiter_server_roundtrip(tmp_path):
+    port = free_port()
+    token = "test-secret"
+    server = f"http://127.0.0.1:{port}"
+    binary = build_cli()
+    process = start_server(binary, tmp_path, port, token)
     try:
         wait_for_server(server, token)
         client = flint.SharedLimiter(server, token=token)
@@ -94,18 +111,30 @@ def test_shared_limiter_server_roundtrip(tmp_path):
         assert client.allow("route:/api") is False
         client.flush()
     finally:
-        process.terminate()
-        try:
-            process.wait(timeout=5)
-        except subprocess.TimeoutExpired:
-            process.kill()
-            process.wait(timeout=5)
+        stop_server(process)
+
+
+def test_second_shared_server_on_same_data_dir_fails(tmp_path):
+    token = "test-secret"
+    binary = build_cli()
+    first_port = free_port()
+    second_port = free_port()
+    first = start_server(binary, tmp_path, first_port, token)
+    try:
+        wait_for_server(f"http://127.0.0.1:{first_port}", token)
+        second = start_server(binary, tmp_path, second_port, token)
+        stdout, stderr = second.communicate(timeout=10)
+        assert second.returncode != 0
+        assert (
+            "data directory is already locked" in stderr
+            or "data directory is already locked" in stdout
+        )
+    finally:
+        stop_server(first)
 
 
 def test_shared_server_refuses_non_loopback_without_token(tmp_path):
-    root = Path(__file__).resolve().parents[2]
-    subprocess.run(["cargo", "build", "-p", "flint-cli"], cwd=root, check=True)
-    binary = root / "target" / "debug" / "flint"
+    binary = build_cli()
     result = subprocess.run(
         [
             str(binary),

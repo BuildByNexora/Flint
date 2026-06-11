@@ -212,6 +212,9 @@ limiter.allow("api:user-42")
 Shared mode is useful for multiple web workers, local services, or a CLI and app
 that need the same quota state.
 
+The shared server owns the data directory. A second shared server started with
+the same `--data-dir` fails because `flint.lock` is already held.
+
 ---
 
 ## Persistence
@@ -230,6 +233,7 @@ Storage behavior:
 - `flint.aof` is an append-only event log.
 - `flint.snapshot` stores compacted derived state.
 - `flint.lock` prevents two writers on the same directory.
+- shared mode is tested to reject a second server on the same data directory.
 - AOF and snapshot records include integrity checks.
 - Middle corruption fails loudly.
 - A truncated final AOF tail is handled as a crash tail.
