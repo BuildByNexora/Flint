@@ -92,6 +92,7 @@ def test_shared_limiter_server_roundtrip(tmp_path):
         assert route_status["key"] == "route:/api"
         assert client.allow("route:/api") is True
         assert client.allow("route:/api") is False
+        client.flush()
     finally:
         process.terminate()
         try:

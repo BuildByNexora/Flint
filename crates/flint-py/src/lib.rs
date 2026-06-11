@@ -3,7 +3,9 @@
 
 use std::sync::Arc;
 
-use flint_core::{Algorithm, CheckResult as CoreCheckResult, FlintError, MultiCheckItem, TopBy};
+use flint_core::{
+    Algorithm, CheckResult as CoreCheckResult, FlintError, MultiCheckItem, SyncMode, TopBy,
+};
 use pyo3::create_exception;
 use pyo3::exceptions::{PyException, PyRuntimeError, PyValueError};
 use pyo3::prelude::*;
@@ -36,10 +38,18 @@ struct CheckResult {
 #[allow(clippy::useless_conversion)]
 impl Limiter {
     #[new]
-    #[pyo3(signature = (data_dir=".flint"))]
-    fn new(data_dir: &str) -> PyResult<Self> {
+    #[pyo3(signature = (data_dir=".flint", *, sync="always", flush_every_ms=100, flush_every_events=100))]
+    fn new(
+        data_dir: &str,
+        sync: &str,
+        flush_every_ms: u64,
+        flush_every_events: u64,
+    ) -> PyResult<Self> {
+        let sync_mode = parse_sync_mode(sync, flush_every_ms, flush_every_events)?;
         Ok(Self {
-            inner: Arc::new(flint_core::Limiter::open(data_dir).map_err(py_err)?),
+            inner: Arc::new(
+                flint_core::Limiter::open_with_sync(data_dir, sync_mode).map_err(py_err)?,
+            ),
         })
     }
 
@@ -127,6 +137,10 @@ impl Limiter {
 
     fn compact(&self, py: Python<'_>) -> PyResult<()> {
         py.allow_threads(|| self.inner.compact()).map_err(py_err)
+    }
+
+    fn flush(&self, py: Python<'_>) -> PyResult<()> {
+        py.allow_threads(|| self.inner.flush()).map_err(py_err)
     }
 
     fn doctor(&self, py: Python<'_>) -> PyResult<PyObject> {
@@ -221,14 +235,14 @@ impl PyRateLimitedFunction {
         args: &Bound<'_, pyo3::types::PyTuple>,
         kwargs: Option<&Bound<'_, PyDict>>,
     ) -> PyResult<PyObject> {
-        if self.limiter.status(&self.key).map_err(py_err)?.is_none() {
-            self.limiter
-                .limit(&self.key, self.rate, &self.per, self.algorithm)
-                .map_err(py_err)?;
-        }
-        let result = self
-            .limiter
-            .check_cost(&self.key, self.cost)
+        let result = py
+            .allow_threads(|| {
+                if self.limiter.status(&self.key)?.is_none() {
+                    self.limiter
+                        .limit(&self.key, self.rate, &self.per, self.algorithm)?;
+                }
+                self.limiter.check_cost(&self.key, self.cost)
+            })
             .map_err(py_err)?;
         if !result.allowed {
             return Err(rate_limit_error(result)?);
@@ -257,6 +271,19 @@ fn parse_top_by(value: &str) -> PyResult<TopBy> {
         "denied" => Ok(TopBy::Denied),
         other => Err(PyValueError::new_err(format!(
             "unsupported top selector: {other}"
+        ))),
+    }
+}
+
+fn parse_sync_mode(sync: &str, flush_every_ms: u64, flush_every_events: u64) -> PyResult<SyncMode> {
+    match sync {
+        "always" => Ok(SyncMode::Always),
+        "batch" => Ok(SyncMode::Batch {
+            flush_every_events,
+            flush_every_ms,
+        }),
+        other => Err(PyValueError::new_err(format!(
+            "unsupported sync mode {other:?}; expected 'always' or 'batch'"
         ))),
     }
 }

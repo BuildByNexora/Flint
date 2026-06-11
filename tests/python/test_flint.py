@@ -130,3 +130,33 @@ def test_compact_doctor_top(tmp_path):
     assert report["snapshot_exists"] is True
     top = limiter.top(by="denied", limit=1)
     assert top[0]["key"] == "x"
+
+
+def test_batch_sync_mode_can_flush_for_recovery(tmp_path):
+    limiter = flint.Limiter(
+        data_dir=str(tmp_path),
+        sync="batch",
+        flush_every_ms=60_000,
+        flush_every_events=10_000,
+    )
+    limiter.limit("batched", rate=2, per="1m")
+    assert limiter.allow("batched") is True
+    limiter.flush()
+    del limiter
+
+    limiter = flint.Limiter(data_dir=str(tmp_path))
+    status = limiter.status("batched")
+    assert status["total_allowed"] == 1
+    assert status["remaining"] == 1
+
+
+def test_batch_sync_validates_thresholds(tmp_path):
+    with pytest.raises(ValueError):
+        flint.Limiter(data_dir=str(tmp_path), sync="nope")
+    with pytest.raises(ValueError):
+        flint.Limiter(
+            data_dir=str(tmp_path),
+            sync="batch",
+            flush_every_ms=0,
+            flush_every_events=100,
+        )

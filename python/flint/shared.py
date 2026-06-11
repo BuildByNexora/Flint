@@ -102,6 +102,9 @@ class SharedLimiter:
     def compact(self) -> None:
         self._request("POST", "/v1/log/compact", {})
 
+    def flush(self) -> None:
+        self._request("POST", "/v1/log/flush", {})
+
     def doctor(self) -> dict[str, Any]:
         return self._request("GET", "/v1/doctor")
 

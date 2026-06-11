@@ -7,7 +7,7 @@ use axum::http::{HeaderMap, StatusCode};
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use clap::{Parser, Subcommand};
-use flint_core::{Algorithm, Limiter, MultiCheckItem, TopBy};
+use flint_core::{Algorithm, Limiter, MultiCheckItem, SyncMode, TopBy};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
@@ -91,6 +91,12 @@ enum ServerCommand {
         token: Option<String>,
         #[arg(long, default_value_t = 128)]
         max_blocking: usize,
+        #[arg(long, default_value = "always")]
+        sync: String,
+        #[arg(long, default_value_t = 100)]
+        flush_every_ms: u64,
+        #[arg(long, default_value_t = 100)]
+        flush_every_events: u64,
     },
 }
 
@@ -142,7 +148,6 @@ async fn main() {
 }
 
 async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
-    let limiter = Limiter::open(&cli.data_dir)?;
     match cli.command {
         Command::Limit { command } => match command {
             LimitCommand::Add {
@@ -151,22 +156,27 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
                 per,
                 algorithm,
             } => {
+                let limiter = Limiter::open(&cli.data_dir)?;
                 limiter.limit(key, rate, per, Algorithm::parse(&algorithm)?)?;
                 println!("configured");
             }
             LimitCommand::List => {
+                let limiter = Limiter::open(&cli.data_dir)?;
                 println!("{}", serde_json::to_string_pretty(&limiter.list()?)?);
             }
             LimitCommand::Status { key } => {
+                let limiter = Limiter::open(&cli.data_dir)?;
                 println!("{}", serde_json::to_string_pretty(&limiter.status(&key)?)?);
             }
             LimitCommand::Check { key, cost } => {
+                let limiter = Limiter::open(&cli.data_dir)?;
                 println!(
                     "{}",
                     serde_json::to_string_pretty(&limiter.check_cost(&key, cost)?)?
                 );
             }
             LimitCommand::CheckAll { keys, costs } => {
+                let limiter = Limiter::open(&cli.data_dir)?;
                 let items = multi_items_from_cli(keys, costs)?;
                 println!(
                     "{}",
@@ -174,13 +184,16 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
                 );
             }
             LimitCommand::Reset { key } => {
+                let limiter = Limiter::open(&cli.data_dir)?;
                 limiter.reset(&key)?;
                 println!("reset");
             }
             LimitCommand::History { key } => {
+                let limiter = Limiter::open(&cli.data_dir)?;
                 println!("{}", serde_json::to_string_pretty(&limiter.history(&key)?)?);
             }
             LimitCommand::Top { by, limit } => {
+                let limiter = Limiter::open(&cli.data_dir)?;
                 let by = match by.as_str() {
                     "allowed" => TopBy::Allowed,
                     "denied" => TopBy::Denied,
@@ -194,6 +207,7 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
         },
         Command::Log { command } => match command {
             LogCommand::Compact => {
+                let limiter = Limiter::open(&cli.data_dir)?;
                 limiter.compact()?;
                 println!("compacted");
             }
@@ -203,15 +217,36 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
                 bind,
                 token,
                 max_blocking,
+                sync,
+                flush_every_ms,
+                flush_every_events,
             } => {
+                let sync_mode = parse_sync_mode(&sync, flush_every_ms, flush_every_events)?;
+                let limiter = Limiter::open_with_sync(&cli.data_dir, sync_mode)?;
                 run_server(limiter, bind, token, max_blocking).await?;
             }
         },
         Command::Doctor => {
+            let limiter = Limiter::open(&cli.data_dir)?;
             println!("{}", serde_json::to_string_pretty(&limiter.doctor()?)?);
         }
     }
     Ok(())
+}
+
+fn parse_sync_mode(
+    sync: &str,
+    flush_every_ms: u64,
+    flush_every_events: u64,
+) -> Result<SyncMode, Box<dyn std::error::Error>> {
+    match sync {
+        "always" => Ok(SyncMode::Always),
+        "batch" => Ok(SyncMode::Batch {
+            flush_every_events,
+            flush_every_ms,
+        }),
+        other => Err(format!("unsupported sync mode {other:?}; expected always or batch").into()),
+    }
 }
 
 fn multi_items_from_cli(
@@ -268,6 +303,7 @@ async fn run_server(
         .route("/v1/check", post(check_limit))
         .route("/v1/check-all", post(check_all))
         .route("/v1/reset", post(reset_limit))
+        .route("/v1/log/flush", post(flush_log))
         .route("/v1/log/compact", post(compact_log))
         .route("/v1/doctor", get(doctor))
         .with_state(state);
@@ -368,6 +404,16 @@ async fn compact_log(
     authorize(&state, &headers)?;
     let limiter = Arc::clone(&state.limiter);
     blocking_core(&state, move || limiter.compact()).await?;
+    Ok(Json(json!({ "ok": true })))
+}
+
+async fn flush_log(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<ErrorResponse>)> {
+    authorize(&state, &headers)?;
+    let limiter = Arc::clone(&state.limiter);
+    blocking_core(&state, move || limiter.flush()).await?;
     Ok(Json(json!({ "ok": true })))
 }
 

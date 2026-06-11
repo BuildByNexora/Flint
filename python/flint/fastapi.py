@@ -6,6 +6,7 @@ from typing import Callable, Iterable, Optional, Set, Union
 from . import Limiter
 
 try:
+    import anyio
     from starlette.middleware.base import BaseHTTPMiddleware
     from starlette.requests import Request
     from starlette.responses import JSONResponse, Response
@@ -56,9 +57,7 @@ class FlintRateLimitMiddleware(BaseHTTPMiddleware):
         key = self._request_key(request)
         cost = self._request_cost(request)
 
-        self._ensure_limit(key)
-        result = self.limiter.check(key, cost=cost)
-        status = self.limiter.status(key) or {}
+        result, status = await anyio.to_thread.run_sync(self._check_request, key, cost)
         headers = _rate_limit_headers(result, status.get("rate"))
         if not result.allowed:
             return JSONResponse(
@@ -84,6 +83,12 @@ class FlintRateLimitMiddleware(BaseHTTPMiddleware):
         if self.limiter.status(key) is None:
             self.limiter.limit(key, rate=self.rate, per=self.per, algorithm=self.algorithm)
         self._configured.add(key)
+
+    def _check_request(self, key: str, cost: int):
+        self._ensure_limit(key)
+        result = self.limiter.check(key, cost=cost)
+        status = self.limiter.status(key) or {}
+        return result, status
 
     def _request_key(self, request: Request) -> str:
         key = self.key if self.key is not None else self.key_func(request)  # type: ignore[misc]

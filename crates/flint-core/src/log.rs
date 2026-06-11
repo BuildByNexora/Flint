@@ -1,6 +1,7 @@
 use std::fs::{File, OpenOptions};
 use std::io::{BufRead, BufReader, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
+use std::time::{Duration, Instant};
 
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
@@ -30,10 +31,16 @@ struct LogPayload<'a> {
 pub struct AppendOnlyLog {
     path: PathBuf,
     file: File,
+    sync_policy: SyncPolicy,
+    pending_events: u64,
+    last_sync: Instant,
 }
 
 impl AppendOnlyLog {
-    pub fn open(path: impl AsRef<Path>) -> Result<Self, FlintError> {
+    pub fn open_with_sync(
+        path: impl AsRef<Path>,
+        sync_policy: SyncPolicy,
+    ) -> Result<Self, FlintError> {
         let path = path.as_ref().to_path_buf();
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)?;
@@ -49,7 +56,13 @@ impl AppendOnlyLog {
         };
         #[cfg(not(unix))]
         let file = OpenOptions::new().create(true).append(true).open(&path)?;
-        Ok(Self { path, file })
+        Ok(Self {
+            path,
+            file,
+            sync_policy,
+            pending_events: 0,
+            last_sync: Instant::now(),
+        })
     }
 
     pub fn append(&mut self, event: &Event) -> Result<(), FlintError> {
@@ -68,8 +81,26 @@ impl AppendOnlyLog {
         let mut encoded = serde_json::to_string(&entry)?;
         encoded.push('\n');
         self.file.write_all(encoded.as_bytes())?;
-        self.file.sync_data()?;
+        self.pending_events = self.pending_events.saturating_add(1);
+        if self.should_sync() {
+            self.flush()?;
+        }
         Ok(())
+    }
+
+    pub fn flush(&mut self) -> Result<(), FlintError> {
+        if self.pending_events == 0 {
+            return Ok(());
+        }
+        self.file.flush()?;
+        self.file.sync_data()?;
+        self.pending_events = 0;
+        self.last_sync = Instant::now();
+        Ok(())
+    }
+
+    pub fn has_pending_events(&self) -> bool {
+        self.pending_events > 0
     }
 
     pub fn len(&self) -> Result<u64, FlintError> {
@@ -109,8 +140,39 @@ impl AppendOnlyLog {
         self.file.set_len(0)?;
         self.file.seek(SeekFrom::Start(0))?;
         self.file.sync_all()?;
+        self.pending_events = 0;
+        self.last_sync = Instant::now();
         Ok(())
     }
+
+    fn should_sync(&self) -> bool {
+        match self.sync_policy {
+            SyncPolicy::Always => true,
+            SyncPolicy::Batch {
+                flush_every_events,
+                flush_every,
+            } => {
+                self.pending_events >= flush_every_events || self.last_sync.elapsed() >= flush_every
+            }
+        }
+    }
+}
+
+impl Drop for AppendOnlyLog {
+    fn drop(&mut self) {
+        if self.pending_events > 0 {
+            let _ = self.flush();
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+pub enum SyncPolicy {
+    Always,
+    Batch {
+        flush_every_events: u64,
+        flush_every: Duration,
+    },
 }
 
 fn verify_entry_checksum(entry: &LogEntry, line: usize) -> Result<(), FlintError> {

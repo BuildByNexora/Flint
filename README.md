@@ -51,6 +51,8 @@ Flint is an embedded rate limiter with:
 - Prometheus metrics export;
 - shared HTTP server mode;
 - Python `SharedLimiter` client;
+- configurable sync mode: `always` or `batch`;
+- asyncio-friendly wrapper methods;
 - atomic multi-limit checks with `allow_all()` / `check_all()`;
 - token bucket algorithm;
 - sliding window log algorithm;
@@ -58,7 +60,7 @@ Flint is an embedded rate limiter with:
 - crash recovery from local files;
 - storage doctor checks;
 - v0.1 AOF compatibility for `per_seconds` entries;
-- no Redis, broker, or cloud dependency.
+- no Redis, broker, or cloud dependency;
 - no daemon required for embedded mode.
 
 ---
@@ -160,6 +162,56 @@ if limiter.allow_all(["user:42", "org:acme", "endpoint:/v1/chat"]):
     process_request()
 ```
 
+Performance sync mode:
+
+```python
+# Default: safest mode, fsync after every persisted event.
+safe = flint.Limiter(data_dir=".flint", sync="always")
+
+# Higher throughput: write every event, fsync in batches.
+fast = flint.Limiter(
+    data_dir=".flint-fast",
+    sync="batch",
+    flush_every_ms=100,
+    flush_every_events=100,
+)
+
+fast.limit("api:user-42", rate=100, per="1m")
+fast.allow("api:user-42")
+fast.flush()  # force fsync now
+```
+
+`sync="batch"` is useful for high-throughput services that can accept losing the
+last small batch of events after a hard crash or power loss. Process shutdown
+flushes pending events automatically; `flush()` can be called manually before
+critical boundaries.
+
+Async Python API:
+
+```python
+import asyncio
+import flint
+
+async def main():
+    limiter = flint.Limiter(data_dir=".flint")
+
+    await limiter.alimit("api:user-42", rate=100, per="1m")
+    result = await limiter.acheck("api:user-42")
+
+    if result.allowed:
+        await process_request()
+
+    status = await limiter.astatus("api:user-42")
+    print(status["remaining"])
+
+asyncio.run(main())
+```
+
+Async wrapper methods run the sync limiter call in a thread executor, so native
+async applications can use Flint without blocking the event loop directly. For
+route-level FastAPI limiting, prefer the middleware; for manual async decisions,
+use `acheck()` / `aallow()`.
+
 Millisecond precision:
 
 ```python
@@ -255,7 +307,10 @@ Start the server:
 flint --data-dir .flint-shared server start \
   --bind 127.0.0.1:7878 \
   --token dev-secret \
-  --max-blocking 128
+  --max-blocking 128 \
+  --sync batch \
+  --flush-every-ms 100 \
+  --flush-every-events 100
 ```
 
 Use it from Python:
@@ -294,6 +349,7 @@ HTTP API:
 | `/v1/check` | `POST` | check/consume one limit |
 | `/v1/check-all` | `POST` | atomic multi-limit check |
 | `/v1/reset` | `POST` | reset a limit |
+| `/v1/log/flush` | `POST` | force pending batch writes to disk |
 | `/v1/log/compact` | `POST` | compact AOF into snapshot |
 | `/v1/doctor` | `GET` | storage/runtime health |
 
@@ -306,7 +362,13 @@ Authorization: Bearer <token>
 Flint refuses to bind the shared server to a non-loopback address such as
 `0.0.0.0` unless a token is configured. Storage operations run on bounded
 blocking workers controlled by `--max-blocking`, so persistent writes do not
-block the async HTTP runtime.
+block the async HTTP runtime. Server mode supports the same storage sync modes
+as embedded mode: `--sync always` for maximum durability and `--sync batch` for
+higher throughput.
+
+For public or enterprise network exposure, put Flint behind a reverse proxy,
+service mesh, or load balancer that handles TLS/mTLS, certificate rotation, and
+network policy. See the [Security Guide](docs/usage/security.md).
 
 Shared mode keeps Flint's core model simple: one writer owns the data directory;
 other processes use the server API instead of opening the same files directly.
@@ -403,6 +465,7 @@ flint limit top --by denied --limit 20
 flint log compact
 flint doctor
 flint server start --bind 127.0.0.1:7878 --token dev-secret
+flint server start --bind 127.0.0.1:7878 --token dev-secret --sync batch
 ```
 
 Use a custom data directory:
@@ -460,6 +523,17 @@ Flint v0.2 uses millisecond precision internally. Older v0.1 AOF entries that
 stored `per_seconds` are migrated during replay by converting seconds to
 milliseconds.
 
+### Sync Modes
+
+| Mode | Behavior | Use case |
+|---|---|---|
+| `always` | flush + fsync after every event | maximum durability |
+| `batch` | write every event, fsync every N events or N ms | higher throughput |
+
+`always` is the default. `batch` keeps writes append-only but delays fsync, so a
+hard crash can lose the last unsynced batch. Normal process shutdown and
+`flush()` force pending events to disk.
+
 Metrics exposed by `status()` and `list()`:
 
 ```text
@@ -511,7 +585,7 @@ limiter:
 - Prometheus text export and FastAPI `/metrics` route;
 - Python decorator allowed/denied behavior;
 - `RateLimitExceeded` metadata;
-- CLI `compact`, `doctor`, and `top`.
+- CLI `compact`, `doctor`, and `top`;
 - Criterion benchmarks for hot path checks, many keys, AOF replay, and compaction.
 
 ---
@@ -543,21 +617,33 @@ Latest local quick run:
 
 | Benchmark | Result |
 |---|---:|
-| token bucket persistent check | ~560 us |
-| sliding window persistent check | ~570 us |
-| fixed window persistent check | ~600 us |
-| cost-based token bucket check | ~620 us |
-| `check_all()` over 3 limits | ~590 us |
-| configure 1,000 keys | ~562 ms |
-| configure 10,000 keys | ~5.5 s |
-| reopen from 1,000 AOF events | ~5 ms |
-| reopen from 10,000 AOF events | ~49 ms |
-| compact 1,000 AOF events | ~39 ms |
-| compact 10,000 AOF events | ~415 ms |
+| token bucket persistent check | ~556 us |
+| sliding window persistent check | ~575 us |
+| fixed window persistent check | ~592 us |
+| cost-based token bucket check | ~569 us |
+| `check_all()` over 3 limits | ~552 us |
+| configure 1,000 keys | ~584 ms |
+| configure 10,000 keys | ~5.60 s |
+| reopen from 1,000 AOF events | ~4.59 ms |
+| reopen from 10,000 AOF events | ~43.0 ms |
+| compact 1,000 AOF events | ~31.3 ms |
+| compact 10,000 AOF events | ~347 ms |
 
 These numbers are from a local quick run and are mainly useful as a regression
 baseline. Full Criterion runs should be used when comparing releases or storage
 changes.
+
+---
+
+## Documentation
+
+- [Python Usage](docs/usage/python.md)
+- [CLI Usage](docs/usage/cli.md)
+- [FastAPI Usage](docs/usage/fastapi.md)
+- [Shared Mode](docs/usage/shared-mode.md)
+- [Security Guide](docs/usage/security.md)
+- [Storage Format](docs/reference/storage-format.md)
+- [Release Checklist](docs/usage/release.md)
 
 ---
 

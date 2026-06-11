@@ -5,7 +5,10 @@ use std::collections::{HashMap, VecDeque};
 use std::fs::{File, OpenOptions};
 use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::sync::Mutex;
+use std::sync::mpsc::{self, Sender};
+use std::sync::{Arc, Mutex};
+use std::thread::{self, JoinHandle};
+use std::time::Duration as StdDuration;
 
 use chrono::{DateTime, Duration, Utc};
 use fs2::FileExt;
@@ -14,6 +17,42 @@ use sha2::{Digest, Sha256};
 use thiserror::Error;
 
 pub use parse::parse_duration;
+
+#[derive(Debug, Clone, Copy)]
+pub enum SyncMode {
+    Always,
+    Batch {
+        flush_every_events: u64,
+        flush_every_ms: u64,
+    },
+}
+
+impl SyncMode {
+    fn into_policy(self) -> Result<log::SyncPolicy, FlintError> {
+        match self {
+            Self::Always => Ok(log::SyncPolicy::Always),
+            Self::Batch {
+                flush_every_events,
+                flush_every_ms,
+            } => {
+                if flush_every_events == 0 {
+                    return Err(FlintError::InvalidDuration(
+                        "flush_every_events must be greater than zero".into(),
+                    ));
+                }
+                if flush_every_ms == 0 {
+                    return Err(FlintError::InvalidDuration(
+                        "flush_every_ms must be greater than zero".into(),
+                    ));
+                }
+                Ok(log::SyncPolicy::Batch {
+                    flush_every_events,
+                    flush_every: StdDuration::from_millis(flush_every_ms),
+                })
+            }
+        }
+    }
+}
 
 #[derive(Debug, Error)]
 pub enum FlintError {
@@ -246,13 +285,68 @@ const SNAPSHOT_FORMAT_VERSION: u32 = 1;
 
 pub struct Limiter {
     data_dir: PathBuf,
-    log: Mutex<log::AppendOnlyLog>,
+    log: Arc<Mutex<log::AppendOnlyLog>>,
     state: Mutex<State>,
+    _background_flusher: Option<BackgroundFlusher>,
     _lock_file: File,
+}
+
+struct BackgroundFlusher {
+    stop: Sender<()>,
+    handle: Option<JoinHandle<()>>,
+}
+
+impl Drop for BackgroundFlusher {
+    fn drop(&mut self) {
+        let _ = self.stop.send(());
+        if let Some(handle) = self.handle.take() {
+            let _ = handle.join();
+        }
+    }
+}
+
+fn start_background_flusher(
+    log: &Arc<Mutex<log::AppendOnlyLog>>,
+    sync_mode: SyncMode,
+) -> Option<BackgroundFlusher> {
+    let SyncMode::Batch { flush_every_ms, .. } = sync_mode else {
+        return None;
+    };
+    let (stop, stop_rx) = mpsc::channel();
+    let log = Arc::clone(log);
+    let interval = StdDuration::from_millis(flush_every_ms);
+    let handle = thread::spawn(move || {
+        loop {
+            match stop_rx.recv_timeout(interval) {
+                Ok(_) | Err(mpsc::RecvTimeoutError::Disconnected) => break,
+                Err(mpsc::RecvTimeoutError::Timeout) => {
+                    if let Ok(mut log) = log.lock() {
+                        if log.has_pending_events() {
+                            let _ = log.flush();
+                        }
+                    }
+                }
+            }
+        }
+        if let Ok(mut log) = log.lock() {
+            let _ = log.flush();
+        }
+    });
+    Some(BackgroundFlusher {
+        stop,
+        handle: Some(handle),
+    })
 }
 
 impl Limiter {
     pub fn open(data_dir: impl AsRef<Path>) -> Result<Self, FlintError> {
+        Self::open_with_sync(data_dir, SyncMode::Always)
+    }
+
+    pub fn open_with_sync(
+        data_dir: impl AsRef<Path>,
+        sync_mode: SyncMode,
+    ) -> Result<Self, FlintError> {
         let data_dir = data_dir.as_ref().to_path_buf();
         std::fs::create_dir_all(&data_dir)?;
         #[cfg(unix)]
@@ -286,22 +380,35 @@ impl Limiter {
                 path: lock_path.display().to_string(),
             })?;
 
-        let log = log::AppendOnlyLog::open(data_dir.join("flint.aof"))?;
+        let log = Arc::new(Mutex::new(log::AppendOnlyLog::open_with_sync(
+            data_dir.join("flint.aof"),
+            sync_mode.into_policy()?,
+        )?));
         let (mut state, offset) = read_snapshot(&data_dir)?.unwrap_or_default();
-        for event in log.replay_from(offset)? {
+        for event in log
+            .lock()
+            .expect("limiter log lock poisoned")
+            .replay_from(offset)?
+        {
             apply_event(&mut state, event);
         }
+        let background_flusher = start_background_flusher(&log, sync_mode);
 
         Ok(Self {
             data_dir,
-            log: Mutex::new(log),
+            log,
             state: Mutex::new(state),
+            _background_flusher: background_flusher,
             _lock_file: lock_file,
         })
     }
 
     pub fn data_dir(&self) -> &Path {
         &self.data_dir
+    }
+
+    pub fn flush(&self) -> Result<(), FlintError> {
+        self.log.lock().expect("limiter log lock poisoned").flush()
     }
 
     pub fn limit(
@@ -500,6 +607,7 @@ impl Limiter {
 
     pub fn compact(&self) -> Result<(), FlintError> {
         let mut log = self.log.lock().expect("limiter log lock poisoned");
+        log.flush()?;
         let mut state = self.state.lock().expect("limiter state lock poisoned");
         refresh_all_summaries(&mut state);
         let snapshot = Snapshot {
@@ -1435,5 +1543,73 @@ mod tests {
                 .unwrap();
         }
         assert_eq!(limiter.list().unwrap().len(), 10_000);
+    }
+
+    #[test]
+    fn batch_sync_flushes_pending_events_for_recovery() {
+        let dir = TempDir::new().unwrap();
+        let limiter = Limiter::open_with_sync(
+            dir.path(),
+            SyncMode::Batch {
+                flush_every_events: 10_000,
+                flush_every_ms: 60_000,
+            },
+        )
+        .unwrap();
+        limiter
+            .limit("batched", 2, "1m", Algorithm::TokenBucket)
+            .unwrap();
+        assert!(limiter.allow("batched").unwrap());
+        limiter.flush().unwrap();
+        drop(limiter);
+
+        let limiter = Limiter::open(dir.path()).unwrap();
+        let status = limiter.status("batched").unwrap().unwrap();
+        assert_eq!(status.total_allowed, 1);
+        assert_eq!(status.remaining, 1);
+    }
+
+    #[test]
+    fn batch_sync_background_flushes_after_interval() {
+        let dir = TempDir::new().unwrap();
+        let limiter = Limiter::open_with_sync(
+            dir.path(),
+            SyncMode::Batch {
+                flush_every_events: 10_000,
+                flush_every_ms: 25,
+            },
+        )
+        .unwrap();
+        limiter
+            .limit("timed", 2, "1m", Algorithm::TokenBucket)
+            .unwrap();
+        assert!(limiter.allow("timed").unwrap());
+        std::thread::sleep(std::time::Duration::from_millis(120));
+
+        let aof = std::fs::File::open(dir.path().join("flint.aof")).unwrap();
+        aof.sync_all().unwrap();
+        let len = aof.metadata().unwrap().len();
+        assert!(len > 0);
+    }
+
+    #[test]
+    fn batch_sync_rejects_zero_thresholds() {
+        let dir = TempDir::new().unwrap();
+        assert!(Limiter::open_with_sync(
+            dir.path(),
+            SyncMode::Batch {
+                flush_every_events: 0,
+                flush_every_ms: 100,
+            },
+        )
+        .is_err());
+        assert!(Limiter::open_with_sync(
+            dir.path(),
+            SyncMode::Batch {
+                flush_every_events: 100,
+                flush_every_ms: 0,
+            },
+        )
+        .is_err());
     }
 }
